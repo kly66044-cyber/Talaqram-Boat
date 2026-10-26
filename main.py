@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Fast Email Validator Bot — Live Dashboard & Stop Button
-# pip install python-telegram-bot dnspython email-validator
+# Email Validator Bot — Bulletproof Async Engine
+# pip install "python-telegram-bot>=20.0" dnspython email-validator
 
 import asyncio
 import csv
@@ -11,20 +11,21 @@ import smtplib
 import threading
 import time
 import dns.resolver
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from email_validator import validate_email, EmailNotValidError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 BOT_TOKEN = "5741020078:AAHUloa0BhSSSjNT2UZrqoeL2F-I6O5uifQ"
-ADMIN_ID = 5870967455  # ضع الآيدي بتاعك
-FROM_ADDRESS = "verify@yourdomain.com"
-SMTP_TIMEOUT = 6
-MAX_WORKERS = 20
+ADMIN_ID = 5870967455 
+FROM_ADDRESS = "tjrbhtht888@gmail.com" # يفضل تخليها إيميل حقيقي لو بتستخدم SMTP
+SMTP_TIMEOUT = 5
+MAX_WORKERS = 50 
 
 # ==========================================
 # GLOBAL STATE
@@ -32,53 +33,27 @@ MAX_WORKERS = 20
 IS_CHECKING = False
 STOP_REQUESTED = False
 mx_cache = {}
-mx_cache_lock = threading.Lock()
 stats = {"checked": 0, "valid": 0, "invalid": 0, "unknown": 0, "bad_syntax": 0}
-total_emails = 0
-start_time = 0
 
 # ==========================================
 # CORE CHECKER LOGIC
 # ==========================================
 def get_mx_host(domain):
-    with mx_cache_lock:
-        if domain in mx_cache:
-            return mx_cache[domain]
+    if domain in mx_cache:
+        return mx_cache[domain]
     try:
-        answers = dns.resolver.resolve(domain, "MX")
+        answers = dns.resolver.resolve(domain, "MX", lifetime=5)
         records = sorted(answers, key=lambda r: r.preference)
         host = str(records[0].exchange).rstrip(".")
     except Exception:
         host = None
-    with mx_cache_lock:
-        mx_cache[domain] = host
+    mx_cache[domain] = host
     return host
-
-def smtp_check(email, mx_host):
-    global STOP_REQUESTED
-    if STOP_REQUESTED:
-        return "skipped (stopped)"
-    try:
-        server = smtplib.SMTP(timeout=SMTP_TIMEOUT)
-        server.connect(mx_host)
-        server.helo(server.local_hostname)
-        server.mail(FROM_ADDRESS)
-        code, _ = server.rcpt(email)
-        server.quit()
-        if code == 250:
-            return "valid"
-        elif code in (550, 551, 553):
-            return "invalid"
-        return "unknown"
-    except (socket.timeout, smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError):
-        return "unknown (blocked/timeout)"
-    except Exception:
-        return "unknown"
 
 def check_one(email):
     global STOP_REQUESTED
     if STOP_REQUESTED:
-        return None
+        return {"email": email, "syntax_valid": False, "domain": "", "has_mx": False, "smtp_result": "stopped", "notes": ""}
 
     row = {"email": email, "syntax_valid": False, "domain": "", "has_mx": False, "smtp_result": "skipped", "notes": ""}
     try:
@@ -97,15 +72,31 @@ def check_one(email):
         row["smtp_result"] = "invalid (no MX record)"
         return row
 
-    result = smtp_check(email, mx_host)
-    row["smtp_result"] = result
+    # SMTP Check
+    try:
+        server = smtplib.SMTP(timeout=SMTP_TIMEOUT)
+        server.connect(mx_host, 25)
+        server.helo(server.local_hostname)
+        server.mail(FROM_ADDRESS)
+        code, _ = server.rcpt(email)
+        server.quit()
+        
+        if code == 250:
+            row["smtp_result"] = "valid"
+        elif code in (550, 551, 553):
+            row["smtp_result"] = "invalid"
+        else:
+            row["smtp_result"] = f"unknown (code {code})"
+    except Exception as e:
+        row["smtp_result"] = f"unknown ({type(e).__name__})"
+    
     return row
 
 # ==========================================
 # ASYNC BACKGROUND TASK
 # ==========================================
 async def process_emails(update: Update, context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
-    global IS_CHECKING, STOP_REQUESTED, stats, total_emails, start_time
+    global IS_CHECKING, STOP_REQUESTED, stats
     chat_id = update.effective_chat.id
     
     IS_CHECKING = True
@@ -114,59 +105,71 @@ async def process_emails(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
     
     try:
         text_data = file_bytes.decode('utf-8', errors='ignore')
-        emails = [line.strip() for line in text_data.splitlines() if line.strip()]
+        emails = list(set([line.strip() for line in text_data.splitlines() if line.strip()]))
     except Exception:
         await context.bot.send_message(chat_id=chat_id, text="❌ فشل في قراءة الملف.")
         IS_CHECKING = False
         return
 
     total_emails = len(emails)
-    start_time = time.time()
-    results = []
-    
+    if total_emails == 0:
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ الملف فاضي.")
+        IS_CHECKING = False
+        return
+
     stop_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛑 إيقاف الفحص", callback_data="stop_check")]
     ])
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"⏳ **جاري تجهيز الفحص...**\n\n📁 الإجمالي: `{total_emails}`",
+        text=f"⏳ **بدء الفحص...**\n\n📁 الإجمالي: `{total_emails}`",
         reply_markup=stop_kb,
         parse_mode="Markdown"
     )
 
-    # تنفيذ الفحص
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(check_one, email): email for email in emails}
+    results = []
+    start_time = time.time()
+    loop = asyncio.get_running_loop()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        # نرسل المهام لـ Threads
+        tasks = [loop.run_in_executor(pool, check_one, email) for email in emails]
         
-        last_update = time.time()
-        for future in as_completed(futures):
+        # نستقبل النتائج أول بأول
+        for i, future in enumerate(asyncio.as_completed(tasks)):
             if STOP_REQUESTED:
                 break
                 
-            result = future.result()
-            if result is not None:
-                results.append(result)
+            try:
+                result = await future
+            except Exception as e:
+                continue
                 
-                # تحديث الإحصائيات
-                if not result["syntax_valid"]:
-                    stats["bad_syntax"] += 1
-                elif not result["has_mx"]:
+            if result is None or result["smtp_result"] == "stopped":
+                continue
+
+            results.append(result)
+            
+            # تحديث الإحصائيات
+            if not result["syntax_valid"]:
+                stats["bad_syntax"] += 1
+            elif not result["has_mx"]:
+                stats["invalid"] += 1
+            else:
+                res = result["smtp_result"]
+                if res == "valid":
+                    stats["valid"] += 1
+                elif res == "invalid":
                     stats["invalid"] += 1
                 else:
-                    res = result["smtp_result"]
-                    if res == "valid":
-                        stats["valid"] += 1
-                    elif res == "invalid":
-                        stats["invalid"] += 1
-                    else:
-                        stats["unknown"] += 1
-                
-                stats["checked"] += 1
+                    stats["unknown"] += 1
+            
+            stats["checked"] += 1
 
-            # تحديث واجهة تلجرام كل 2 ثانية
-            if time.time() - last_update > 2.0:
-                elapsed = max(time.time() - start_time, 0.001)
+            # تحديث واجهة تلجرام كل 5 إيميلات عشان ما نضربش حظر
+            if stats["checked"] % 5 == 0 or stats["checked"] == total_emails:
+                elapsed = max(time.time() - start_time, 0.1)
                 rate = stats["checked"] / elapsed
                 remaining = total_emails - stats["checked"]
                 eta = remaining / rate if rate > 0 else 0
@@ -184,19 +187,10 @@ async def process_emails(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
                 
                 try:
                     await status_msg.edit_text(dash, reply_markup=stop_kb, parse_mode="Markdown")
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
                 except Exception:
-                    pass # تجاهل أخطاء الفلود
-                
-                last_update = time.time()
-
-    # إنشاء ملف CSV النهائي
-    out_file = io.BytesIO()
-    out_file.write("email,syntax_valid,domain,has_mx,smtp_result,notes\n".encode('utf-8'))
-    for r in results:
-        line = f"{r['email']},{r['syntax_valid']},{r['domain']},{r['has_mx']},{r['smtp_result']},{r['notes']}\n"
-        out_file.write(line.encode('utf-8'))
-    out_file.seek(0)
-    out_file.name = "verify_results.csv"
+                    pass
 
     # رسالة النهاية
     if STOP_REQUESTED:
@@ -204,15 +198,27 @@ async def process_emails(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
     else:
         final_text = f"🏁 **تم الانتهاء!**\n\n🔍 تم فحص: `{total_emails}` إيميل."
 
-    await status_msg.edit_text(final_text, parse_mode="Markdown")
+    try:
+        await status_msg.edit_text(final_text, parse_mode="Markdown")
+    except:
+        pass
     
-    # إرسال الملف
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=out_file,
-        filename="verify_results.csv",
-        caption=f"✅ **النتائج:**\nصحيح: {stats['valid']} | خاطئ: {stats['invalid']} | غير معروف: {stats['unknown']}"
-    )
+    # تجهيز الملف
+    if results:
+        out_file = io.BytesIO()
+        out_file.write("email,syntax_valid,domain,has_mx,smtp_result,notes\n".encode('utf-8'))
+        for r in results:
+            line = f"{r['email']},{r['syntax_valid']},{r['domain']},{r['has_mx']},{r['smtp_result']},{r['notes']}\n"
+            out_file.write(line.encode('utf-8'))
+        out_file.seek(0)
+        out_file.name = "verify_results.csv"
+        
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=out_file,
+            filename="verify_results.csv",
+            caption=f"✅ **النتائج:**\nصحيح: {stats['valid']} | خاطئ: {stats['invalid']} | غير معروف: {stats['unknown']}"
+        )
     
     IS_CHECKING = False
 
@@ -222,25 +228,18 @@ async def process_emails(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    text = (
+    await update.message.reply_text(
         "👁️ **Email Validator Bot**\n\n"
-        "أرسل ملف `.txt` فيه قائمة إيميلات، وسأقوم بفحصهم (Syntax + MX + SMTP).\n"
-        "ستظهر لك لوحة التحكم مباشرة في الشات مع زر إيقاف."
+        "أرسل ملف `.txt` فيه إيميلات، وسأفحصهم (Syntax + MX + SMTP).\n"
+        "البوت سريع ومقاوم للتهنيج."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global IS_CHECKING
-    if update.effective_user.id != ADMIN_ID:
-        return
-        
-    if IS_CHECKING:
-        await update.message.reply_text("⚠️ يوجد فحص قيد التشغيل حالياً. أوقفه أولاً.")
+    if update.effective_user.id != ADMIN_ID or IS_CHECKING:
         return
         
     doc = update.message.document
     if not doc.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ أرسل ملف `.txt` فقط.")
         return
 
     msg = await update.message.reply_text("⏳ جاري تحميل الملف...")
@@ -275,7 +274,6 @@ async def stop_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     os.system('clear')
     print("[*] Email Validator Bot is starting...")
-    print("[*] Waiting for files via Telegram...")
     
     request = HTTPXRequest(connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0, pool_timeout=60.0)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
