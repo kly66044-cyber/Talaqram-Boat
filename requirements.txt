@@ -1,6 +1,8 @@
+python-telegram-bot>=20.0
+dnspython
+email-validator
 requests
 aiohttp
 pyfiglet
 termcolor
 cfonts
-python-telegram-bot>=20.0
